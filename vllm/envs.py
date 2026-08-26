@@ -256,6 +256,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB: int | None = None
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: int | None = None
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
+    VLLM_MOONCAKE_PD_PROFILE: bool = False
+    VLLM_MOONCAKE_PD_PROFILE_DIR: str = "/tmp/vllm_pd_profile"
+    VLLM_MOONCAKE_PD_PROFILE_ROLE: str = "unknown"
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
@@ -1810,6 +1813,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
         os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")
+    ),
+    # Enable fine-grained PD disaggregation timing marks (JSONL).
+    "VLLM_MOONCAKE_PD_PROFILE": lambda: (
+        os.getenv("VLLM_MOONCAKE_PD_PROFILE", "").lower() in ("1", "true", "yes")
+    ),
+    # Directory for PD profile JSONL files (proxy/prefill/decode.jsonl).
+    "VLLM_MOONCAKE_PD_PROFILE_DIR": lambda: os.getenv(
+        "VLLM_MOONCAKE_PD_PROFILE_DIR", "/tmp/vllm_pd_profile"
+    ),
+    # Role label written into PD profile records (proxy/prefill/decode).
+    "VLLM_MOONCAKE_PD_PROFILE_ROLE": lambda: os.getenv(
+        "VLLM_MOONCAKE_PD_PROFILE_ROLE", "unknown"
     ),
     # If set, it means we pre-downloaded cubin files and flashinfer will
     # read the cubin files directly.

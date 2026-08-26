@@ -215,6 +215,8 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        # PD profile: reqs promoted from WAITING_FOR_REMOTE_KVS awaiting N0.
+        self._pd_profile_pending_n0: set[str] = set()
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -1158,6 +1160,9 @@ class Scheduler(SchedulerInterface):
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if request_id in self._pd_profile_pending_n0:
+                    self._pd_profile_pending_n0.discard(request_id)
+                    self._pd_profile_mark("N0", request)
                 if pad_spec_decode:
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
@@ -2831,6 +2836,7 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.PREEMPTED
             else:
                 request.status = RequestStatus.WAITING
+            self._pd_profile_mark("M", request)
             return True
 
         if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
@@ -2851,6 +2857,24 @@ class Scheduler(SchedulerInterface):
             "Unexpected blocked waiting status in promotion: "
             f"{request.status.name} for request {request.request_id}"
         )
+
+    def _pd_profile_mark(self, name: str, request: Request) -> None:
+        """Emit a PD profile mark when profiling is enabled (no-op otherwise)."""
+        params = request.kv_transfer_params
+        if not params or not params.get("transfer_id"):
+            return
+        try:
+            from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.pd_profile import (
+                enabled as pd_enabled,
+                mark as pd_mark,
+            )
+        except ImportError:
+            return
+        if not pd_enabled():
+            return
+        pd_mark(name, str(params["transfer_id"]), role="decode")
+        if name == "M":
+            self._pd_profile_pending_n0.add(request.request_id)
 
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """

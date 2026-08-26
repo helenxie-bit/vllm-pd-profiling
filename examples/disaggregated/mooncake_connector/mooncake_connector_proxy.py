@@ -6,6 +6,7 @@ import asyncio
 import ipaddress
 import itertools
 import os
+import sys
 import urllib
 import uuid
 from contextlib import asynccontextmanager
@@ -14,6 +15,27 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+
+# Allow importing vllm.pd_profile helper when run as a standalone script.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+try:
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.pd_profile import (
+        mark as pd_mark,
+        set_role as pd_set_role,
+    )
+except ImportError:  # pragma: no cover
+
+    def pd_mark(*_args, **_kwargs):
+        pass
+
+    def pd_set_role(_role: str):
+        pass
+
+
+pd_set_role(os.getenv("VLLM_MOONCAKE_PD_PROFILE_ROLE", "proxy"))
 
 
 def maybe_wrap_ipv6_address(address: str) -> str:
@@ -253,11 +275,12 @@ async def send_request_to_service(
     """
     Send a request to a service using a client from the pool.
     """
+    transfer_id = f"xfer-{request_id}"
     req_data = req_data.copy()
     req_data["kv_transfer_params"] = {
         "do_remote_decode": True,
         "do_remote_prefill": False,
-        "transfer_id": f"xfer-{request_id}",
+        "transfer_id": transfer_id,
     }
     req_data["stream"] = False
     req_data["max_tokens"] = 1
@@ -278,6 +301,7 @@ async def send_request_to_service(
 
     # CRITICAL: Release connection back to pool
     await response.aclose()
+    pd_mark("A1", transfer_id, role="proxy")
 
 
 async def stream_service_response(
@@ -291,6 +315,7 @@ async def stream_service_response(
     """
     Asynchronously stream response from a service using a client from the pool.
     """
+    transfer_id = f"xfer-{request_id}"
     headers = {
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
@@ -301,15 +326,40 @@ async def stream_service_response(
         "do_remote_prefill": True,
         "remote_bootstrap_addr": prefill_client_info["bootstrap_addr"],
         "remote_engine_id": prefill_client_info["dp_engine_id"][prefill_dp_rank],
-        "transfer_id": f"xfer-{request_id}",
+        "transfer_id": transfer_id,
     }
 
+    pd_mark("D0", transfer_id, role="proxy")
     async with decode_client_info["client"].stream(
         "POST", endpoint, json=req_data, headers=headers
     ) as response:
         response.raise_for_status()
+        first_token = True
         async for chunk in response.aiter_bytes():
+            if not chunk:
+                yield chunk
+                continue
+            if first_token:
+                pd_mark("N1", transfer_id, role="proxy")
+                first_token = False
+            else:
+                pd_mark("O", transfer_id, role="proxy")
             yield chunk
+
+
+def _workload_fields(req_data: dict) -> dict[str, int | str | None]:
+    """Extract workload metadata for IETF workload characterization."""
+    extra: dict[str, int | str | None] = {}
+    max_out = req_data.get("max_tokens") or req_data.get("max_completion_tokens")
+    if max_out is not None:
+        extra["max_output_tokens"] = int(max_out)
+    prompt = req_data.get("prompt")
+    if isinstance(prompt, str):
+        extra["prompt_chars"] = len(prompt)
+    messages = req_data.get("messages")
+    if isinstance(messages, list):
+        extra["num_messages"] = len(messages)
+    return extra
 
 
 async def _handle_completions(api: str, request: Request):
@@ -319,6 +369,8 @@ async def _handle_completions(api: str, request: Request):
     try:
         req_data = await request.json()
         request_id = str(uuid.uuid4())
+        transfer_id = f"xfer-{request_id}"
+        pd_mark("A0", transfer_id, role="proxy", **_workload_fields(req_data))
 
         # Get the next prefill client in round-robin fashion
         prefill_client_info, prefill_dp_rank = get_next_client(request.app, "prefill")
@@ -347,7 +399,6 @@ async def _handle_completions(api: str, request: Request):
         return StreamingResponse(generate_stream(), media_type="application/json")
 
     except Exception as e:
-        import sys
         import traceback
 
         exc_info = sys.exc_info()

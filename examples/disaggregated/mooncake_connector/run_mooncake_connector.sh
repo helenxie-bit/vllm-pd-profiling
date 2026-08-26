@@ -15,6 +15,9 @@
 #   DECODE_PORTS: Comma-separated ports for decode servers
 #   PROXY_PORT: Proxy server port used to setup P/D disaggregated connection.
 #   TIMEOUT_SECONDS: Server startup timeout
+#   MOONCAKE_DEVICE_NAME: Optional RoCE/IB NIC whitelist (e.g. mlx5_0)
+#   VLLM_MOONCAKE_PD_PROFILE: Set to 1 to enable PD stage timing marks
+#   VLLM_MOONCAKE_PD_PROFILE_DIR: JSONL output directory
 # =============================================================================
 
 # Configuration - can be overridden via environment variables
@@ -28,6 +31,21 @@ PREFILL_PORTS=${PREFILL_PORTS:-8010}
 BOOTSTRAP_PORTS=${BOOTSTRAP_PORTS:-8998}
 DECODE_PORTS=${DECODE_PORTS:-8020}
 
+MOONCAKE_DEVICE_NAME=${MOONCAKE_DEVICE_NAME:-}
+VLLM_MOONCAKE_PD_PROFILE=${VLLM_MOONCAKE_PD_PROFILE:-0}
+VLLM_MOONCAKE_PD_PROFILE_DIR=${VLLM_MOONCAKE_PD_PROFILE_DIR:-/tmp/vllm_pd_profile}
+
+# Build kv_connector_extra_config JSON fragment.
+build_extra_config() {
+    local extras='"mooncake_protocol":"rdma"'
+    if [[ -n "$MOONCAKE_DEVICE_NAME" ]]; then
+        extras+=",\"device_name\":\"${MOONCAKE_DEVICE_NAME}\""
+    fi
+    echo "$extras"
+}
+
+KV_EXTRA=$(build_extra_config)
+
 echo "Warning: Mooncake Connector support for vLLM v1 is experimental and subject to change."
 echo ""
 echo "Architecture Configuration:"
@@ -36,6 +54,8 @@ echo "  Prefill GPUs: $PREFILL_GPUS, Ports: $PREFILL_PORTS, Bootstrap Port:$BOOT
 echo "  Decode GPUs: $DECODE_GPUS, Ports: $DECODE_PORTS"
 echo "  Proxy Port: $PROXY_PORT"
 echo "  Timeout: ${TIMEOUT_SECONDS}s"
+echo "  Mooncake device_name: ${MOONCAKE_DEVICE_NAME:-<all>}"
+echo "  PD profile: $VLLM_MOONCAKE_PD_PROFILE (dir=$VLLM_MOONCAKE_PD_PROFILE_DIR)"
 echo ""
 
 PIDS=()
@@ -130,6 +150,13 @@ main() {
     trap cleanup USR1
     trap cleanup TERM
 
+    if [[ "$VLLM_MOONCAKE_PD_PROFILE" == "1" || "$VLLM_MOONCAKE_PD_PROFILE" == "true" ]]; then
+        mkdir -p "$VLLM_MOONCAKE_PD_PROFILE_DIR"
+        rm -f "$VLLM_MOONCAKE_PD_PROFILE_DIR"/*.jsonl
+        export VLLM_MOONCAKE_PD_PROFILE=1
+        export VLLM_MOONCAKE_PD_PROFILE_DIR
+    fi
+
     echo "Launching disaggregated serving components..."
     echo "Please check the log files for detailed output:"
     echo "  - prefill*.log: Prefill server logs"
@@ -156,10 +183,13 @@ main() {
         local bootstrap_port=${BOOTSTRAP_PORT_ARRAY[$i]}
 
         echo "  Prefill server $((i+1)): GPU $gpu_id, Port $port, Bootstrap Port $bootstrap_port"
-        VLLM_MOONCAKE_BOOTSTRAP_PORT=$bootstrap_port CUDA_VISIBLE_DEVICES=$gpu_id vllm serve "$MODEL" \
+        VLLM_MOONCAKE_PD_PROFILE_ROLE=prefill \
+        VLLM_MOONCAKE_BOOTSTRAP_PORT=$bootstrap_port CUDA_VISIBLE_DEVICES=$gpu_id \
+        vllm serve "$MODEL" \
         --port "$port" \
         --kv-transfer-config \
-        "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\"}" > prefill$((i+1)).log 2>&1 &
+        "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{${KV_EXTRA}}}" \
+        > prefill$((i+1)).log 2>&1 &
         PIDS+=($!)
         proxy_args+=(--prefill "http://0.0.0.0:${port}" "$bootstrap_port")
     done
@@ -174,10 +204,12 @@ main() {
         local port=${DECODE_PORT_ARRAY[$i]}
 
         echo "  Decode server $((i+1)): GPU $gpu_id, Port $port"
+        VLLM_MOONCAKE_PD_PROFILE_ROLE=decode \
         CUDA_VISIBLE_DEVICES=$gpu_id vllm serve "$MODEL" \
         --port "$port" \
         --kv-transfer-config \
-        "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_consumer\"}" > decode$((i+1)).log 2>&1 &
+        "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{${KV_EXTRA}}}" \
+        > decode$((i+1)).log 2>&1 &
         PIDS+=($!)
         proxy_args+=(--decode "http://0.0.0.0:${port}")
     done
@@ -187,6 +219,7 @@ main() {
     # =============================================================================
     echo ""
     echo "Starting proxy server on port $PROXY_PORT..."
+    VLLM_MOONCAKE_PD_PROFILE_ROLE=proxy \
     python3 mooncake_connector_proxy.py "${proxy_args[@]}" --port "$PROXY_PORT" > proxy.log 2>&1 &
     PIDS+=($!)
 
@@ -214,6 +247,12 @@ main() {
         --backend vllm --model "$MODEL" \
         --dataset-name random --random-input-len 7500 --random-output-len 200 \
         --num-prompts 200 --burstiness 100 --request-rate 2 | tee benchmark.log
+
+    if [[ "$VLLM_MOONCAKE_PD_PROFILE" == "1" || "$VLLM_MOONCAKE_PD_PROFILE" == "true" ]]; then
+        echo ""
+        echo "Analyzing PD profile marks in $VLLM_MOONCAKE_PD_PROFILE_DIR ..."
+        python3 analyze_pd_profile.py --dir "$VLLM_MOONCAKE_PD_PROFILE_DIR" || true
+    fi
 
     echo "Benchmarking done. Cleaning up..."
 

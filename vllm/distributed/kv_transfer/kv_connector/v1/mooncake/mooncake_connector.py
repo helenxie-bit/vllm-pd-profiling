@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -34,6 +35,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
     RegisterWorkerPayload,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.pd_profile import (
+    mark as pd_mark,
+    set_role as pd_set_role,
+    transfer_id_from_params,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
@@ -607,6 +613,8 @@ class MooncakeConnectorScheduler:
         self.is_kv_consumer: bool = (
             vllm_config.kv_transfer_config.kv_role == "kv_consumer"
         )
+        if not os.getenv("VLLM_MOONCAKE_PD_PROFILE_ROLE"):
+            pd_set_role("prefill" if self.is_kv_producer else "decode")
         logger.info("Initializing Mooncake Transfer Engine Scheduler %s", engine_id)
 
         self._is_hma_required = (
@@ -724,6 +732,8 @@ class MooncakeConnectorScheduler:
                 num_computed_tokens
             )
             if count > 0:
+                tid = transfer_id_from_params(params)
+                pd_mark("E", tid, role="decode")
                 return count, True
 
         if params.get("do_remote_decode") and self._has_mamba:
@@ -764,6 +774,11 @@ class MooncakeConnectorScheduler:
                 local_block_ids = self.get_sw_clipped_blocks(unhashed_block_ids)
                 # Get unhashed blocks to pull from remote.
                 self._reqs_need_recv[request.request_id] = (request, local_block_ids)
+                pd_mark(
+                    "F",
+                    transfer_id_from_params(params),
+                    role="decode",
+                )
             else:
                 logger.warning(
                     "Got invalid KVTransferParams: %s. This "
@@ -795,6 +810,11 @@ class MooncakeConnectorScheduler:
                     request_id=req_id,
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
+                )
+                pd_mark(
+                    "F1",
+                    transfer_id_from_params(req.kv_transfer_params),
+                    role="decode",
                 )
             self._reqs_need_recv.clear()
 
@@ -866,6 +886,20 @@ class MooncakeConnectorScheduler:
                 request,
                 self.get_sw_clipped_blocks(block_ids),
             )
+            # B / C_sched: P prefill finished and blocks queued for send.
+            num_prompt_tokens = len(request.prompt_token_ids or [])
+            pd_mark(
+                "B",
+                params["transfer_id"],
+                role="prefill",
+                num_prompt_tokens=num_prompt_tokens,
+            )
+            pd_mark(
+                "C_sched",
+                params["transfer_id"],
+                role="prefill",
+                num_prompt_tokens=num_prompt_tokens,
+            )
 
         return delay_free_blocks, None
 
@@ -896,6 +930,8 @@ class MooncakeConnectorWorker:
         assert (kv_transfer_config := vllm_config.kv_transfer_config)
         self.is_kv_producer: bool = kv_transfer_config.kv_role == "kv_producer"
         self.is_kv_consumer: bool = kv_transfer_config.kv_role == "kv_consumer"
+        if not os.getenv("VLLM_MOONCAKE_PD_PROFILE_ROLE"):
+            pd_set_role("prefill" if self.is_kv_producer else "decode")
         self.num_sender_workers = kv_transfer_config.kv_connector_extra_config.get(
             "num_workers", 10
         )
@@ -1170,6 +1206,8 @@ class MooncakeConnectorWorker:
         self, identity: bytes, sock: zmq.asyncio.Socket, meta: MooncakeXferMetadata
     ):
         pending_reqs: dict[ReqId, SendBlockMeta] = {}
+        for transfer_id, _ in meta.req_blocks.values():
+            pd_mark("H1", transfer_id, role="prefill")
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(meta.remote_tp_size)
         if meta.remote_tp_rank not in remote_tp_ranks:
             # This D worker does not pair with the P worker.
@@ -1240,7 +1278,9 @@ class MooncakeConnectorWorker:
         async def wait_and_ret(
             d_req_id: ReqId, send_meta: SendBlockMeta
         ) -> tuple[ReqId, SendBlockMeta]:
+            pd_mark("I0", send_meta.transfer_id, role="prefill")
             await send_meta.ready.wait()
+            pd_mark("I1", send_meta.transfer_id, role="prefill")
             return d_req_id, send_meta
 
         wait_tasks = [
@@ -1312,8 +1352,19 @@ class MooncakeConnectorWorker:
                 if d_req_id not in err_req_set
             ]
 
+            transfer_ids = [send_meta.transfer_id for _, send_meta in ok_ready_reqs]
+            total_bytes = sum(lengths)
+            num_descriptors = len(src_ptrs)
             if src_ptrs:
                 remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                for tid in transfer_ids:
+                    pd_mark(
+                        "K0",
+                        tid,
+                        role="prefill",
+                        total_bytes=total_bytes,
+                        num_descriptors=num_descriptors,
+                    )
                 ret_value = await self.sender_loop.run_in_executor(
                     self._sender_executor,
                     self._send_blocks,
@@ -1322,6 +1373,14 @@ class MooncakeConnectorWorker:
                     dst_ptrs,
                     lengths,
                 )
+                for tid in transfer_ids:
+                    pd_mark(
+                        "K1",
+                        tid,
+                        role="prefill",
+                        total_bytes=total_bytes,
+                        num_descriptors=num_descriptors,
+                    )
 
                 if ret_value != 0:
                     transfer_err_msg = f"Mooncake transfer engine returned {ret_value}"
@@ -1355,6 +1414,8 @@ class MooncakeConnectorWorker:
                 err_reqs=err_reqs or None,
                 err_msg=err_msg,
             )
+            for _, send_meta in ok_ready_reqs:
+                pd_mark("L0", send_meta.transfer_id, role="prefill")
             await sock.send_multipart((identity, self._encoder.encode(response)))
 
     def resolve_need_send(
@@ -1404,6 +1465,8 @@ class MooncakeConnectorWorker:
         local_regions: list[TransferRegion],
         remote_regions: list[TransferRegion],
     ) -> tuple[list[int], list[int], list[int], list[ReqId], str | None]:
+        for _, send_meta in ready_reqs:
+            pd_mark("J0", send_meta.transfer_id, role="prefill")
         src_ptrs = []
         dst_ptrs = []
         lengths = []
@@ -1587,6 +1650,8 @@ class MooncakeConnectorWorker:
                 remote_session,
             )
 
+        for _, send_meta in ready_reqs:
+            pd_mark("J1", send_meta.transfer_id, role="prefill")
         return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg
 
     def _bind_sender_thread_device(self) -> None:
@@ -1828,6 +1893,8 @@ class MooncakeConnectorWorker:
                 sock.setsockopt(
                     zmq.RCVTIMEO, (envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT + 60) * 1000
                 )
+                for pull_meta in pull_metas.values():
+                    pd_mark("H0", pull_meta.transfer_id, role="decode")
                 await sock.send(encoded_data)
                 while True:
                     ret_msg = await sock.recv()
@@ -1863,6 +1930,7 @@ class MooncakeConnectorWorker:
             pull_meta.pull_tasks_count -= 1
             if pull_meta.pull_tasks_count == 0:
                 self.finished_recving_reqs.add(pull_meta.d_req_id)
+                pd_mark("L1", pull_meta.transfer_id, role="decode")
 
         if ok_reqs:
             logger.debug("pulling kv_caches for %s finished", ok_reqs)
@@ -1942,11 +2010,15 @@ class MooncakeConnectorWorker:
         pull_metas: dict[ReqId, PullReqMeta],
     ):
         remote_bootstrap_addr = next(iter(pull_metas.values())).remote_bootstrap_addr
+        for pull_meta in pull_metas.values():
+            pd_mark("G0", pull_meta.transfer_id, role="decode")
         if remote_bootstrap_addr not in self._pending_bootstrap_queries:
             self._pending_bootstrap_queries[remote_bootstrap_addr] = asyncio.Event()
             await self._connect_to_prefiller_bootstrap(remote_bootstrap_addr)
         else:
             await self._pending_bootstrap_queries[remote_bootstrap_addr].wait()
+        for pull_meta in pull_metas.values():
+            pd_mark("G1", pull_meta.transfer_id, role="decode")
 
         if remote_engine_id not in self._remote_agents:
             logger.error(
@@ -1967,6 +2039,9 @@ class MooncakeConnectorWorker:
                     self.handle_new_engine_id(remote_engine_id, pull_metas)
                 )
             else:
+                for pull_meta in pull_metas.values():
+                    pd_mark("G0", pull_meta.transfer_id, role="decode")
+                    pd_mark("G1", pull_meta.transfer_id, role="decode")
                 self.receive_kv(remote_engine_id, pull_metas)
 
     async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
@@ -1980,6 +2055,7 @@ class MooncakeConnectorWorker:
                     time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
                 )
                 send_meta.ready.set()
+                pd_mark("C_ready", transfer_id, role="prefill")
             else:
                 # From update_state_after_alloc(),
                 # but not reach request_finished() yet
