@@ -104,8 +104,19 @@ run_bench() {
     local run_dir="$RESULTS_DIR/${tag}_in${input_len}_r${rate}_b${burstiness}_n${num_prompts}"
     mkdir -p "$run_dir"
 
+    # Truncate in place (do not rm): P/D/proxy keep append FDs open; unlinking
+    # would send later marks to deleted inodes and leave PROFILE_DIR empty.
     if [[ "${VLLM_MOONCAKE_PD_PROFILE:-0}" == "1" ]]; then
-        rm -f "$PROFILE_DIR"/*.jsonl
+        if [[ ! -d "$PROFILE_DIR" ]]; then
+            echo "ERROR: PROFILE_DIR=$PROFILE_DIR does not exist." \
+                "Start P/D/proxy with VLLM_MOONCAKE_PD_PROFILE=1 first." >&2
+            exit 1
+        fi
+        shopt -s nullglob
+        for f in "$PROFILE_DIR"/*.jsonl; do
+            : > "$f"
+        done
+        shopt -u nullglob
     fi
 
     echo "=== $tag: input_len=$input_len rate=$rate prompts=$num_prompts burstiness=$burstiness ==="
@@ -119,13 +130,41 @@ run_bench() {
         --burstiness "$burstiness" \
         2>&1 | tee "$run_dir/bench.log"
 
-    if [[ "${VLLM_MOONCAKE_PD_PROFILE:-0}" == "1" && -d "$PROFILE_DIR" ]]; then
-        cp "$PROFILE_DIR"/*.jsonl "$run_dir/" 2>/dev/null || true
+    if [[ "${VLLM_MOONCAKE_PD_PROFILE:-0}" == "1" ]]; then
+        shopt -s nullglob
+        local jsonl_files=("$PROFILE_DIR"/*.jsonl)
+        shopt -u nullglob
+        if [[ ${#jsonl_files[@]} -eq 0 ]]; then
+            echo "ERROR: no *.jsonl under PROFILE_DIR=$PROFILE_DIR after run $tag." \
+                "Ensure P/D/proxy were started with VLLM_MOONCAKE_PD_PROFILE=1" \
+                "and VLLM_MOONCAKE_PD_PROFILE_DIR=$PROFILE_DIR." >&2
+            exit 1
+        fi
+        local nonempty=0
+        local f
+        for f in "${jsonl_files[@]}"; do
+            if [[ -s "$f" ]]; then
+                nonempty=1
+                break
+            fi
+        done
+        if [[ "$nonempty" -eq 0 ]]; then
+            echo "ERROR: *.jsonl under PROFILE_DIR=$PROFILE_DIR are empty after run $tag." \
+                "Marks were not written (servers may still be writing to unlinked" \
+                "files from a prior rm; restart P/D/proxy and retry)." >&2
+            exit 1
+        fi
+        cp "${jsonl_files[@]}" "$run_dir/"
         python3 analyze_pd_profile.py \
             --dir "$run_dir" \
             --csv "$run_dir/metrics.csv" \
             --json "$run_dir/metrics.json" \
             | tee "$run_dir/analysis.txt"
+        if [[ ! -f "$run_dir/metrics.json" ]]; then
+            echo "ERROR: analyze_pd_profile.py did not write $run_dir/metrics.json" \
+                "(no transferable marks in copied JSONL)." >&2
+            exit 1
+        fi
         echo "  KV metrics -> $run_dir/metrics.json (rdma_ms, t_transfer_ms, kv_xfer_bandwidth_gbps)"
     fi
 }
