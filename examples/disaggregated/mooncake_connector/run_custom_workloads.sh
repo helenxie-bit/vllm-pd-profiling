@@ -125,9 +125,9 @@ case "$PROFILE_MODE" in
         : "${NUM_PROMPTS:=50}"
         : "${REPEATS:=1}"
         : "${INPUT_LENS:=256,512,1024,2048,4096,8192,16384}"
-        : "${REQUEST_RATES:=1,2,5,10}"
-        : "${BURSTINESS_VALUES:=0.1, 0.3, 1.0, 3.0, 5.0}"
-        : "${MAX_CONCURRENCIES:=1,2,4,8,16,32,64}"
+        # : "${REQUEST_RATES:=1,2,5,10}"
+        # : "${BURSTINESS_VALUES:=0.1, 0.3, 1.0, 3.0, 5.0}"
+        # : "${MAX_CONCURRENCIES:=1,2,4,8,16,32,64}"
         ;;
     full)
         # Stress/tail characterization: more samples and repetitions.
