@@ -26,6 +26,24 @@ from typing import Any
 IETF_METRIC_KEYS = (
     "ttft_ms",
     "t_prefill_ms",
+    # Prefill stage decomposition: A0→B→C_sched→C_ready→I0 / C_ready→I1
+    "a0_to_b_ms",
+    "a0_to_d0_ms",
+    "a0_to_b_ttft_fraction",
+    "plan_ttft_fraction",
+    "ttft_fabric_ttft_fraction",
+    "promote_lag_ttft_fraction",
+    "b_to_c_sched_ms",
+    "c_sched_to_c_ready_ms",
+    "c_ready_to_i0_ms",
+    "c_ready_to_i1_ms",
+    "h0_to_h1_ms",
+    "h1_to_i0_ms",
+    "m_to_n0_ms",
+    "n0_to_n1_ms",
+    "k1_to_l1_ms",
+    "i1_to_j0_ms",
+    "j1_to_k0_ms",
     "t_transfer_ms",
     "ttft_fabric_ms",
     "t_decode_init_ms",
@@ -135,11 +153,14 @@ def compute_ietf_metrics(marks: list[dict[str, Any]]) -> dict[str, float | int |
     """Compute per-request metrics aligned with IETF Cat-2 / fabric KPIs."""
     a0 = first_mark(marks, "A0", "proxy")
     a1 = first_mark(marks, "A1", "proxy")
-    c_sched = first_mark(marks, "C_sched", "prefill") or first_mark(
-        marks, "B", "prefill"
-    )
+    b = first_mark(marks, "B", "prefill")
+    c_sched = first_mark(marks, "C_sched", "prefill")
+    c_ready = first_mark(marks, "C_ready", "prefill")
+    # Fallback for older traces that only emitted B at the sched handoff.
+    c_sched_or_b = c_sched or b
     d0 = first_mark(marks, "D0", "proxy")
     h0 = first_mark(marks, "H0", "decode")
+    h1 = first_mark(marks, "H1", "prefill")
     i0 = first_mark(marks, "I0", "prefill")
     i1 = first_mark(marks, "I1", "prefill")
     j0 = first_mark(marks, "J0", "prefill")
@@ -155,14 +176,47 @@ def compute_ietf_metrics(marks: list[dict[str, Any]]) -> dict[str, float | int |
 
     ttft_ms = delta_ns(a0, n1)
     # Section 6.1 TTFT decomposition (SUT-E / DUT-PD proxies).
-    t_prefill_ms = delta_ns(a0, a1) or delta_ns(a0, c_sched)
+    t_prefill_ms = delta_ns(a0, a1) or delta_ns(a0, c_sched_or_b)
     t_transfer_ms = delta_ns(h0, l1)  # D-side KV pull stall (H0→L1)
     ttft_fabric_ms = delta_perf(k0, k1)  # RDMA segment (DUT-PD core)
     t_decode_init_ms = delta_ns(l1, n1) or delta_ns(m, n1) or delta_ns(n0, n1)
 
+    # Prefill stage chain (may be negative if marks race / reorder across paths).
+    a0_to_b_ms = delta_ns(a0, b)  # proxy → prefill (wall clock)
+    a0_to_d0_ms = delta_perf(a0, d0)  # proxy: request start → decode HTTP start
+    b_to_c_sched_ms = delta_perf(b, c_sched)  # same process; often ~0
+    c_sched_to_c_ready_ms = delta_perf(c_sched, c_ready)
+    c_ready_to_i0_ms = delta_perf(c_ready, i0)
+    c_ready_to_i1_ms = delta_perf(c_ready, i1)
+    h0_to_h1_ms = delta_ns(h0, h1)  # decode pull start → prefill recv handshake
+    h1_to_i0_ms = delta_perf(h1, i0)  # handshake → wait-ready start (same process)
+    m_to_n0_ms = delta_perf(m, n0)  # decode: promote/sched → first decode step
+    n0_to_n1_ms = delta_ns(n0, n1)  # decode first token → proxy first token
+    k1_to_l1_ms = delta_ns(k1, l1)  # prefill RDMA done → decode pull complete
+    i1_to_j0_ms = delta_perf(i1, j0)  # wait-ready done → plan start
+    j1_to_k0_ms = delta_perf(j1, k0)  # plan done → RDMA start
+
     fabric_fraction: float | None = None
     if ttft_ms and ttft_ms > 0 and t_transfer_ms is not None:
         fabric_fraction = t_transfer_ms / ttft_ms
+
+    a0_to_b_ttft_fraction: float | None = None
+    if ttft_ms and ttft_ms > 0 and a0_to_b_ms is not None:
+        a0_to_b_ttft_fraction = a0_to_b_ms / ttft_ms
+
+    plan_ms = delta_perf(j0, j1)
+    plan_ttft_fraction: float | None = None
+    if ttft_ms and ttft_ms > 0 and plan_ms is not None:
+        plan_ttft_fraction = plan_ms / ttft_ms
+
+    ttft_fabric_ttft_fraction: float | None = None
+    if ttft_ms and ttft_ms > 0 and ttft_fabric_ms is not None:
+        ttft_fabric_ttft_fraction = ttft_fabric_ms / ttft_ms
+
+    promote_lag_ms = delta_ns(l1, m)
+    promote_lag_ttft_fraction: float | None = None
+    if ttft_ms and ttft_ms > 0 and promote_lag_ms is not None:
+        promote_lag_ttft_fraction = promote_lag_ms / ttft_ms
 
     rdma_ms = delta_perf(k0, k1)
     kv_xfer_latency_us = rdma_ms * 1000.0 if rdma_ms is not None else None
@@ -174,8 +228,8 @@ def compute_ietf_metrics(marks: list[dict[str, Any]]) -> dict[str, float | int |
 
     itls = itl_samples(marks)
     num_prompt_tokens = None
-    if c_sched and c_sched.get("num_prompt_tokens") is not None:
-        num_prompt_tokens = int(c_sched["num_prompt_tokens"])
+    if c_sched_or_b and c_sched_or_b.get("num_prompt_tokens") is not None:
+        num_prompt_tokens = int(c_sched_or_b["num_prompt_tokens"])
     elif a0 and a0.get("prompt_chars") is not None:
         # Rough fallback when token count unavailable (~4 chars/token).
         num_prompt_tokens = int(a0["prompt_chars"]) // 4
@@ -183,6 +237,23 @@ def compute_ietf_metrics(marks: list[dict[str, Any]]) -> dict[str, float | int |
     return {
         "ttft_ms": ttft_ms,
         "t_prefill_ms": t_prefill_ms,
+        "a0_to_b_ms": a0_to_b_ms,
+        "a0_to_d0_ms": a0_to_d0_ms,
+        "a0_to_b_ttft_fraction": a0_to_b_ttft_fraction,
+        "plan_ttft_fraction": plan_ttft_fraction,
+        "ttft_fabric_ttft_fraction": ttft_fabric_ttft_fraction,
+        "promote_lag_ttft_fraction": promote_lag_ttft_fraction,
+        "b_to_c_sched_ms": b_to_c_sched_ms,
+        "c_sched_to_c_ready_ms": c_sched_to_c_ready_ms,
+        "c_ready_to_i0_ms": c_ready_to_i0_ms,
+        "c_ready_to_i1_ms": c_ready_to_i1_ms,
+        "h0_to_h1_ms": h0_to_h1_ms,
+        "h1_to_i0_ms": h1_to_i0_ms,
+        "m_to_n0_ms": m_to_n0_ms,
+        "n0_to_n1_ms": n0_to_n1_ms,
+        "k1_to_l1_ms": k1_to_l1_ms,
+        "i1_to_j0_ms": i1_to_j0_ms,
+        "j1_to_k0_ms": j1_to_k0_ms,
         "t_transfer_ms": t_transfer_ms,
         "ttft_fabric_ms": ttft_fabric_ms,
         "t_decode_init_ms": t_decode_init_ms,
@@ -196,9 +267,9 @@ def compute_ietf_metrics(marks: list[dict[str, Any]]) -> dict[str, float | int |
         "itl_mean_ms": statistics.mean(itls) if itls else None,
         "itl_count": len(itls) if itls else 0,
         "wait_ready_ms": delta_perf(i0, i1),
-        "plan_ms": delta_perf(j0, j1),
+        "plan_ms": plan_ms,
         "rdma_ms": rdma_ms,
-        "promote_lag_ms": delta_ns(l1, m),
+        "promote_lag_ms": promote_lag_ms,
         "d_setup_ms": delta_ns(d0, h0),
         "bootstrap_ms": delta_perf(g0, g1),
         "ready_to_rdma_ms": delta_perf(i1, k0),
@@ -295,19 +366,33 @@ def main() -> None:
                 print(f"{key}: mean={statistics.mean(nums):.1f} n={len(nums)}")
             else:
                 print(f"{key}: n/a")
-        elif key == "fabric_fraction":
+        elif key in (
+            "fabric_fraction",
+            "a0_to_b_ttft_fraction",
+            "plan_ttft_fraction",
+            "ttft_fabric_ttft_fraction",
+            "promote_lag_ttft_fraction",
+        ):
             fr = [r.get(key) for r in rows if r.get(key) is not None]
             if fr:
                 print(
-                    f"fabric_fraction: mean={statistics.mean(fr):.3f} "
+                    f"{key}: mean={statistics.mean(fr):.3f} "
                     f"p50={percentile(fr, 0.5):.3f} p99={percentile(fr, 0.99):.3f}"
                 )
             else:
-                print("fabric_fraction: n/a")
+                print(f"{key}: n/a")
         elif key == "kv_xfer_latency_us":
-            print(summarize_us([r.get(key) for r in rows if r.get(key)], key))
+            print(
+                summarize_us(
+                    [r.get(key) for r in rows if r.get(key) is not None], key
+                )
+            )
         else:
-            print(summarize([r.get(key) for r in rows if r.get(key)], key))
+            print(
+                summarize(
+                    [r.get(key) for r in rows if r.get(key) is not None], key
+                )
+            )
 
     # Group by prompt length (Section 6.1 reporting).
     by_prompt: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -322,6 +407,42 @@ def main() -> None:
             grp = by_prompt[gk]
             print(f"\n{gk} (n={len(grp)})")
             print(summarize([r.get("ttft_ms") for r in grp if r.get("ttft_ms")], "ttft_ms"))
+            for stage_key in (
+                "a0_to_b_ms",
+                "a0_to_d0_ms",
+                "b_to_c_sched_ms",
+                "c_sched_to_c_ready_ms",
+                "c_ready_to_i0_ms",
+                "c_ready_to_i1_ms",
+                "h0_to_h1_ms",
+                "h1_to_i0_ms",
+                "m_to_n0_ms",
+                "n0_to_n1_ms",
+                "k1_to_l1_ms",
+                "i1_to_j0_ms",
+                "j1_to_k0_ms",
+            ):
+                print(
+                    summarize(
+                        [r.get(stage_key) for r in grp if r.get(stage_key) is not None],
+                        stage_key,
+                    )
+                )
+            fr_keys = (
+                "a0_to_b_ttft_fraction",
+                "plan_ttft_fraction",
+                "ttft_fabric_ttft_fraction",
+                "promote_lag_ttft_fraction",
+            )
+            for fr_key in fr_keys:
+                fr = [r.get(fr_key) for r in grp if r.get(fr_key) is not None]
+                if fr:
+                    print(
+                        f"{fr_key}: mean={statistics.mean(fr):.3f} "
+                        f"p50={percentile(fr, 0.5):.3f} p99={percentile(fr, 0.99):.3f}"
+                    )
+                else:
+                    print(f"{fr_key}: n/a")
             print(
                 summarize(
                     [r.get("t_transfer_ms") for r in grp if r.get("t_transfer_ms")],
@@ -362,7 +483,13 @@ def main() -> None:
                 }
             elif key in ("itl_count", "num_prompt_tokens", "kv_bytes"):
                 summary["metrics"][key] = {"mean": statistics.mean(vals), "n": len(vals)}
-            elif key == "fabric_fraction":
+            elif key in (
+                "fabric_fraction",
+                "a0_to_b_ttft_fraction",
+                "plan_ttft_fraction",
+                "ttft_fabric_ttft_fraction",
+                "promote_lag_ttft_fraction",
+            ):
                 summary["metrics"][key] = {
                     "mean": statistics.mean(vals),
                     "p50": percentile(vals, 0.5),
