@@ -62,6 +62,8 @@ IETF_METRIC_KEYS = (
     "promote_lag_ms",
     "num_prompt_tokens",
     "kv_bytes",
+    "num_descriptors",
+    "bytes_per_descriptor",
 )
 
 
@@ -133,6 +135,55 @@ def percentile(vals: list[float], p: float) -> float:
     if f == c:
         return s[int(k)]
     return s[f] * (c - k) + s[c] * (k - f)
+
+
+def clean_floats(vals: list[float | None]) -> list[float]:
+    return [v for v in vals if v is not None and not math.isnan(v)]
+
+
+def summary_stats(
+    vals: list[float | None], *, include_p95: bool = True
+) -> dict[str, float]:
+    """Aggregate per-request values into mean and percentile summary."""
+    nums = clean_floats(vals)
+    if not nums:
+        return {}
+    stats: dict[str, float] = {
+        "mean": statistics.mean(nums),
+        "p50": percentile(nums, 0.5),
+        "p99": percentile(nums, 0.99),
+    }
+    if include_p95:
+        stats["p95"] = percentile(nums, 0.95)
+    return stats
+
+
+def xfer_granularity_from_k1(
+    k1: dict[str, Any] | None,
+) -> tuple[int | None, float | None]:
+    """Read Mooncake transfer granularity from prefill K1.
+
+    ``num_descriptors`` is ``len(src_ptrs)`` for the ``batch_transfer_sync_write``
+    call (same value on K0/K1). ``bytes_per_descriptor`` is the mean payload
+    size per descriptor: ``total_bytes / num_descriptors``.
+
+    When several requests share one batched RDMA call, each request's K1 mark
+    carries the **batch** totals (profiling attribution), so
+    ``bytes_per_descriptor`` is batch bytes divided by batch descriptor count,
+    not per-request KV size alone.
+    """
+    if k1 is None:
+        return None, None
+    raw_desc = k1.get("num_descriptors")
+    if raw_desc is None:
+        return None, None
+    num_descriptors = int(raw_desc)
+    if num_descriptors <= 0:
+        return num_descriptors, None
+    raw_bytes = k1.get("total_bytes")
+    if raw_bytes is None:
+        return num_descriptors, None
+    return num_descriptors, int(raw_bytes) / num_descriptors
 
 
 def itl_samples(marks: list[dict[str, Any]]) -> list[float]:
@@ -222,6 +273,7 @@ def compute_ietf_metrics(marks: list[dict[str, Any]]) -> dict[str, float | int |
     kv_xfer_latency_us = rdma_ms * 1000.0 if rdma_ms is not None else None
 
     kv_bytes = k1.get("total_bytes") if k1 else None
+    num_descriptors, bytes_per_descriptor = xfer_granularity_from_k1(k1)
     kv_xfer_bandwidth_gbps: float | None = None
     if kv_bytes and rdma_ms and rdma_ms > 0:
         kv_xfer_bandwidth_gbps = (kv_bytes * 8.0) / (rdma_ms * 1e6)
@@ -277,42 +329,82 @@ def compute_ietf_metrics(marks: list[dict[str, Any]]) -> dict[str, float | int |
         "pull_stall_ms": t_transfer_ms,
         "num_prompt_tokens": num_prompt_tokens,
         "kv_bytes": int(kv_bytes) if kv_bytes is not None else None,
+        "num_descriptors": num_descriptors,
+        "bytes_per_descriptor": bytes_per_descriptor,
     }
 
 
-def summarize_us(vals: list[float], label: str) -> str:
-    vals = [v for v in vals if v is not None and not math.isnan(v)]
-    if not vals:
+def summarize_us(vals: list[float | None], label: str) -> str:
+    stats = summary_stats(vals)
+    if not stats:
         return f"{label}: n/a"
     return (
-        f"{label}: n={len(vals)} "
-        f"p50={percentile(vals, 0.5):.1f} "
-        f"p95={percentile(vals, 0.95):.1f} "
-        f"p99={percentile(vals, 0.99):.1f} us"
+        f"{label}: n={len(clean_floats(vals))} "
+        f"mean={stats['mean']:.1f} "
+        f"p50={stats['p50']:.1f} "
+        f"p95={stats['p95']:.1f} "
+        f"p99={stats['p99']:.1f} us"
     )
 
 
-def summarize(vals: list[float], label: str) -> str:
-    vals = [v for v in vals if v is not None and not math.isnan(v)]
-    if not vals:
+def summarize(vals: list[float | None], label: str) -> str:
+    stats = summary_stats(vals)
+    if not stats:
         return f"{label}: n/a"
     return (
-        f"{label}: n={len(vals)} "
-        f"p50={percentile(vals, 0.5):.3f} "
-        f"p95={percentile(vals, 0.95):.3f} "
-        f"p99={percentile(vals, 0.99):.3f} ms"
+        f"{label}: n={len(clean_floats(vals))} "
+        f"mean={stats['mean']:.3f} "
+        f"p50={stats['p50']:.3f} "
+        f"p95={stats['p95']:.3f} "
+        f"p99={stats['p99']:.3f} ms"
     )
 
 
-def summarize_gbps(vals: list[float], label: str) -> str:
-    vals = [v for v in vals if v is not None and not math.isnan(v)]
-    if not vals:
+def summarize_gbps(vals: list[float | None], label: str) -> str:
+    stats = summary_stats(vals, include_p95=False)
+    if not stats:
         return f"{label}: n/a"
     return (
-        f"{label}: n={len(vals)} "
-        f"mean={statistics.mean(vals):.3f} "
-        f"p50={percentile(vals, 0.5):.3f} "
-        f"p99={percentile(vals, 0.99):.3f} GB/s"
+        f"{label}: n={len(clean_floats(vals))} "
+        f"mean={stats['mean']:.3f} "
+        f"p50={stats['p50']:.3f} "
+        f"p99={stats['p99']:.3f} GB/s"
+    )
+
+
+def summarize_descriptors(vals: list[float | None], label: str) -> str:
+    stats = summary_stats(vals)
+    if not stats:
+        return f"{label}: n/a"
+    return (
+        f"{label}: n={len(clean_floats(vals))} "
+        f"mean={stats['mean']:.1f} "
+        f"p50={stats['p50']:.1f} "
+        f"p95={stats['p95']:.1f} "
+        f"p99={stats['p99']:.1f}"
+    )
+
+
+def summarize_bytes_per_descriptor(vals: list[float | None], label: str) -> str:
+    stats = summary_stats(vals)
+    if not stats:
+        return f"{label}: n/a"
+    return (
+        f"{label}: n={len(clean_floats(vals))} "
+        f"mean={stats['mean']:.0f} "
+        f"p50={stats['p50']:.0f} "
+        f"p95={stats['p95']:.0f} "
+        f"p99={stats['p99']:.0f} bytes/descriptor"
+    )
+
+
+def summarize_fraction(vals: list[float | None], label: str) -> str:
+    stats = summary_stats(vals, include_p95=False)
+    if not stats:
+        return f"{label}: n/a"
+    return (
+        f"{label}: mean={stats['mean']:.3f} "
+        f"p50={stats['p50']:.3f} p99={stats['p99']:.3f}"
     )
 
 
@@ -373,17 +465,22 @@ def main() -> None:
             "ttft_fabric_ttft_fraction",
             "promote_lag_ttft_fraction",
         ):
-            fr = [r.get(key) for r in rows if r.get(key) is not None]
-            if fr:
-                print(
-                    f"{key}: mean={statistics.mean(fr):.3f} "
-                    f"p50={percentile(fr, 0.5):.3f} p99={percentile(fr, 0.99):.3f}"
-                )
-            else:
-                print(f"{key}: n/a")
+            print(summarize_fraction([r.get(key) for r in rows], key))
         elif key == "kv_xfer_latency_us":
             print(
                 summarize_us(
+                    [r.get(key) for r in rows if r.get(key) is not None], key
+                )
+            )
+        elif key == "num_descriptors":
+            print(
+                summarize_descriptors(
+                    [r.get(key) for r in rows if r.get(key) is not None], key
+                )
+            )
+        elif key == "bytes_per_descriptor":
+            print(
+                summarize_bytes_per_descriptor(
                     [r.get(key) for r in rows if r.get(key) is not None], key
                 )
             )
@@ -435,14 +532,7 @@ def main() -> None:
                 "promote_lag_ttft_fraction",
             )
             for fr_key in fr_keys:
-                fr = [r.get(fr_key) for r in grp if r.get(fr_key) is not None]
-                if fr:
-                    print(
-                        f"{fr_key}: mean={statistics.mean(fr):.3f} "
-                        f"p50={percentile(fr, 0.5):.3f} p99={percentile(fr, 0.99):.3f}"
-                    )
-                else:
-                    print(f"{fr_key}: n/a")
+                print(summarize_fraction([r.get(fr_key) for r in grp], fr_key))
             print(
                 summarize(
                     [r.get("t_transfer_ms") for r in grp if r.get("t_transfer_ms")],
@@ -475,50 +565,30 @@ def main() -> None:
             vals = [r.get(key) for r in rows if r.get(key) is not None]
             if not vals:
                 continue
-            if key.endswith("_gbps"):
-                summary["metrics"][key] = {
-                    "mean": statistics.mean(vals),
-                    "p50": percentile(vals, 0.5),
-                    "p99": percentile(vals, 0.99),
-                }
-            elif key in ("itl_count", "num_prompt_tokens", "kv_bytes"):
+            if key in ("itl_count", "num_prompt_tokens", "kv_bytes"):
                 summary["metrics"][key] = {"mean": statistics.mean(vals), "n": len(vals)}
-            elif key in (
-                "fabric_fraction",
-                "a0_to_b_ttft_fraction",
-                "plan_ttft_fraction",
-                "ttft_fabric_ttft_fraction",
-                "promote_lag_ttft_fraction",
-            ):
-                summary["metrics"][key] = {
-                    "mean": statistics.mean(vals),
-                    "p50": percentile(vals, 0.5),
-                    "p99": percentile(vals, 0.99),
-                }
-            else:
-                summary["metrics"][key] = {
-                    "p50": percentile(vals, 0.5),
-                    "p95": percentile(vals, 0.95),
-                    "p99": percentile(vals, 0.99),
-                }
+                continue
+            include_p95 = not (
+                key.endswith("_gbps")
+                or key
+                in (
+                    "fabric_fraction",
+                    "a0_to_b_ttft_fraction",
+                    "plan_ttft_fraction",
+                    "ttft_fabric_ttft_fraction",
+                    "promote_lag_ttft_fraction",
+                )
+            )
+            stats = summary_stats(vals, include_p95=include_p95)
+            if stats:
+                summary["metrics"][key] = stats
         for gk, grp in by_prompt.items():
-            ttfts = [r["ttft_ms"] for r in grp if r.get("ttft_ms")]
-            transfers = [r["t_transfer_ms"] for r in grp if r.get("t_transfer_ms")]
+            ttfts = [r.get("ttft_ms") for r in grp]
+            transfers = [r.get("t_transfer_ms") for r in grp]
             summary["by_prompt_length"][gk] = {
                 "n": len(grp),
-                "ttft_ms": {
-                    "p50": percentile(ttfts, 0.5),
-                    "p95": percentile(ttfts, 0.95),
-                    "p99": percentile(ttfts, 0.99),
-                }
-                if ttfts
-                else None,
-                "t_transfer_ms": {
-                    "p50": percentile(transfers, 0.5),
-                    "p99": percentile(transfers, 0.99),
-                }
-                if transfers
-                else None,
+                "ttft_ms": summary_stats(ttfts) or None,
+                "t_transfer_ms": summary_stats(transfers, include_p95=False) or None,
             }
         args.json.write_text(json.dumps(summary, indent=2))
         print(f"Wrote JSON: {args.json}")

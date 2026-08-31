@@ -18,6 +18,8 @@
 #   MOONCAKE_DEVICE_NAME: Optional RoCE/IB NIC whitelist (e.g. mlx5_0)
 #   VLLM_MOONCAKE_PD_PROFILE: Set to 1 to enable PD stage timing marks
 #   VLLM_MOONCAKE_PD_PROFILE_DIR: JSONL output directory
+#   ENABLE_PREFIX_CACHING: Set to 1 to enable APC (disabled by default so
+#                         profiling transfers the complete prompt KV cache)
 # =============================================================================
 
 # Configuration - can be overridden via environment variables
@@ -34,6 +36,13 @@ DECODE_PORTS=${DECODE_PORTS:-8020}
 MOONCAKE_DEVICE_NAME=${MOONCAKE_DEVICE_NAME:-}
 VLLM_MOONCAKE_PD_PROFILE=${VLLM_MOONCAKE_PD_PROFILE:-0}
 VLLM_MOONCAKE_PD_PROFILE_DIR=${VLLM_MOONCAKE_PD_PROFILE_DIR:-/tmp/vllm_pd_profile}
+ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING:-0}
+
+if [[ "$ENABLE_PREFIX_CACHING" == "1" || "$ENABLE_PREFIX_CACHING" == "true" ]]; then
+    PREFIX_CACHING_ARG=--enable-prefix-caching
+else
+    PREFIX_CACHING_ARG=--no-enable-prefix-caching
+fi
 
 # Build kv_connector_extra_config JSON fragment.
 build_extra_config() {
@@ -56,6 +65,7 @@ echo "  Proxy Port: $PROXY_PORT"
 echo "  Timeout: ${TIMEOUT_SECONDS}s"
 echo "  Mooncake device_name: ${MOONCAKE_DEVICE_NAME:-<all>}"
 echo "  PD profile: $VLLM_MOONCAKE_PD_PROFILE (dir=$VLLM_MOONCAKE_PD_PROFILE_DIR)"
+echo "  Prefix caching: $ENABLE_PREFIX_CACHING"
 echo ""
 
 PIDS=()
@@ -187,6 +197,7 @@ main() {
         VLLM_MOONCAKE_BOOTSTRAP_PORT=$bootstrap_port CUDA_VISIBLE_DEVICES=$gpu_id \
         vllm serve "$MODEL" \
         --port "$port" \
+        "$PREFIX_CACHING_ARG" \
         --kv-transfer-config \
         "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{${KV_EXTRA}}}" \
         > prefill$((i+1)).log 2>&1 &
@@ -207,6 +218,7 @@ main() {
         VLLM_MOONCAKE_PD_PROFILE_ROLE=decode \
         CUDA_VISIBLE_DEVICES=$gpu_id vllm serve "$MODEL" \
         --port "$port" \
+        "$PREFIX_CACHING_ARG" \
         --kv-transfer-config \
         "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{${KV_EXTRA}}}" \
         > decode$((i+1)).log 2>&1 &
